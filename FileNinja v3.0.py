@@ -1,256 +1,183 @@
-import os
-import shutil
+import os, shutil, time, re, winreg
 from pathlib import Path
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import time
-import winreg
-import re
 
-# Получение пути к папке "Загрузки"
+# Кэшируем регулярные выражения, чтобы не создавать их при каждом вызове
+DATE_RE = re.compile(r"(\d{4}[._-]?\d{2}[._-]?\d{2})")
+NUMBER_RE = re.compile(r"(№\s*\d+|\d{3,6})")
+LONG_NUM_RE = re.compile(r"\b\d{10,12}\b")
+ORG_RE = re.compile(r"(ООО\s*\w+|ИП\s*\w+|\b[A-ZА-Я]{2,}\b)", re.I)
+
 def get_download_folder():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-            r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders") as key:
-            downloads = winreg.QueryValueEx(key, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
-            return downloads
-    except Exception:
-        return str(Path.home() / "Downloads")
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+            return winreg.QueryValueEx(key, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
+    except: return str(Path.home() / "Downloads")
 
-source_folder = get_download_folder()
-log_dir = Path(source_folder) / "Логи"
-log_dir.mkdir(parents=True , exist_ok=True)
-log_file = log_dir / "ninja_log.txt"
-
-file_types = {
-    "Документы": [".pdf", ".docx", ".doc", ".txt", ".xls", ".xlsx", ".pptx", ".xml", ".p7s", ".xml.p7s"],
-    "Картинки": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg"],
-    "Видео": [".mp4", ".mov", ".avi", ".mkv"],
-    "Музыка": [".mp3", ".wav", ".ogg", ".flac"],
-    "Архивы": [".zip", ".rar", ".7z", ".tar", ".gz"],
+FILE_TYPES = {
+    "Документы": [".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".xls", ".xlsx", ".csv", ".ods",
+                  ".ppt", ".pptx", ".odp", ".xml", ".p7s", ".xml.p7s", ".xps"],
+    "Картинки": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".tiff", ".heic"],
+    "Видео": [".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mts", ".3gp"],
+    "Музыка": [".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a"],
+    "Архивы": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso"],
+    "Исполняемые": [".exe", ".msi", ".bat", ".cmd", ".ps1"],
+    "Шрифты": [".ttf", ".otf", ".woff", ".woff2"],
+    "ЭЦП/подписи": [".sig", ".p7m", ".cer", ".pem", ".der", ".crt", ".key"],
 }
-
-month_names = {
-    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+MONTHS = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+          7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
+KEYWORD_FOLDERS = {
+    "отчет":"Отчёты","итог":"Отчёты","результат":"Отчёты","report":"Отчёты","баланс":"Отчёты","аналитика":"Отчёты",
+    "счет":"Счета","invoice":"Счета","оплата":"Счета","платеж":"Счета",
+    "накладная":"Накладные","накл":"Накладные","waybill":"Накладные","товар":"Накладные",
+    "договор":"Договоры","contract":"Договоры","оферта":"Договоры",
+    "акт":"Акты","acceptance":"Акты",
+    "фото":"Фото","photo":"Фото","img":"Фото","image":"Фото","скан":"Фото","scan":"Фото","скрин":"Фото","screenshot":"Фото",
+    "протокол":"Протоколы","minutes":"Протоколы","совещание":"Протоколы",
+    "презентация":"Презентации","presentation":"Презентации","slides":"Презентации",
+    "инструкция":"Справки","manual":"Справки","справка":"Справки","регламент":"Справки",
+    "проект":"Проекты","task":"Проекты","план":"Планы","roadmap":"Планы",
+    "тз":"Техдок","техзадание":"Техдок","смета":"Техдок","спецификация":"Техдок","техдок":"Техдок","чертеж":"Техдок","проектирование":"Техдок",
+    "подпись":"Подписи","signature":"Подписи","ecp":"Подписи","сертификат":"Подписи","key":"Подписи",
+    "предложение":"Коммерческие","quotation":"Коммерческие","offer":"Коммерческие","кп":"Коммерческие",
+    "паспорт":"Личное","анкета":"Личное","cv":"Личное","resume":"Личное","диплом":"Личное",
+    "log":"Логи","debug":"Логи","trace":"Логи","ошибка":"Логи","crash":"Логи"
 }
+JUNK_EXTS = {".tmp", ".part", ".crdownload", ".ds_store"}  # множества — быстрее проверки
+JUNK_PREFIXES = ("~$", ".~lock")
 
-keyword_folders = {
-    "отчет": "Отчёты", "отчёт": "Отчёты", "report": "Отчёты", "summary": "Отчёты",
-    "результат": "Отчёты", "photo": "Фото", "фото": "Фото", "img": "Фото",
-    "скрин": "Фото", "накладная": "Накладные", "invoice": "Счета", "счет": "Счета",
-    "log": "Логи", "debug": "Логи", "trace": "Логи", "договор": "Договоры",
-    "contract": "Договоры", "план": "Планы", "project": "Проекты",
-    "task": "Проекты", "презентация": "Презентации", "minutes": "Протоколы"
-}
+SOURCE = get_download_folder()
+LOG_DIR = Path(SOURCE) / "Логи"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "ninja_log.txt"
 
-ignore_prefixes = ["~$", ".~lock"]
-ignore_extensions = [".tmp", ".part", ".crdownload", ".ds_store"]
-
-def log(message):
+def log(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"[{now}] {message}\n")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] {msg}\n")
 
-def should_ignore(filename):
-    lower = filename.lower()
-    return any(lower.startswith(p) for p in ignore_prefixes) or any(lower.endswith(e) for e in ignore_extensions)
-
-def get_extension(filename):
-    base, ext1 = os.path.splitext(filename)
-    ext1 = ext1.lower()
-    if ext1 == ".p7s":
-        base2, ext2 = os.path.splitext(base)
-        ext2 = ext2.lower()
-        if ext2 == ".xml":
-            return ".xml.p7s"
-    return ext1
+def get_ext(filename):
+    base, ext = os.path.splitext(filename.lower())
+    return ".xml.p7s" if ext == ".p7s" and base.endswith(".xml") else ext
 
 def get_category(ext):
-    ext = ext.lower()
-    for category, ext_list in file_types.items():
-        if ext in ext_list:
-            return category
+    for cat, exts in FILE_TYPES.items():
+        if ext in exts: return cat
     return "Прочее"
 
-def get_date_folder(path):
+def get_folder_by_date(path):
     dt = datetime.fromtimestamp(os.path.getctime(path))
-    return f"{dt.year}/{dt.month:02d}.{month_names[dt.month]}"
+    return f"{dt.year}/{dt.month:02d}.{MONTHS[dt.month]}"
 
-def get_keyword_folder(filename):
-    lower = filename.lower()
-    for keyword, folder in keyword_folders.items():
-        if keyword in lower:
+def get_keyword_folder(name):
+    low = name.lower()
+    for key, folder in KEYWORD_FOLDERS.items():
+        if key in low:
             return folder
     return None
 
-def extract_requisites(filename, file_path=None):
-    name, ext = os.path.splitext(filename)
-    number_match = re.search(r"(№\s*\d+|\d{3,6})", name)
-    date_match = re.search(r"(\d{4}[._-]?\d{2}[._-]?\d{2})", name)
-    inn_match = re.search(r"\b\d{10,12}\b", name)
-    company_match = re.search(r"(ООО\s*\w+|ИП\s*\w+|\b[A-ZА-Я]{2,}\b)", name, re.IGNORECASE)
+def should_ignore(name):
+    low = name.lower()
+    return low.endswith(tuple(JUNK_EXTS)) or low.startswith(JUNK_PREFIXES)
 
+def extract_requisites(name):
+    ext = os.path.splitext(name)[1]
     parts = []
-    if date_match:
-        date_str = date_match.group(1).replace("_","").replace(".","").replace("-","")
-        parts.append(date_str)
-    if number_match:
-        parts.append(number_match.group(1).replace("№", "").strip())
-    if inn_match:
-        parts.append(inn_match.group(0))
-    if company_match:
-        parts.append(company_match.group(1).strip())
+    # Используем заранее скомпилированные регексы
+    m = DATE_RE.search(name)
+    if m: parts.append(m.group(1).replace("_","").replace(".","").replace("-",""))
+    m = NUMBER_RE.search(name)
+    if m: parts.append(m.group(1).replace("№","").strip())
+    m = LONG_NUM_RE.search(name)
+    if m: parts.append(m.group(0))
+    m = ORG_RE.search(name)
+    if m: parts.append(m.group(1).strip())
+    return "_".join(parts) + ext if parts else None
 
-    if parts:
-        new_name = "_".join(parts) + ext
-        return new_name
-    return None
-
-def rename_file_with_requisites(file_path):
-    dirname = os.path.dirname(file_path)
-    filename = os.path.basename(file_path)
-
-    new_name = extract_requisites(filename, file_path)
-    if not new_name:
-        return None
-
-    new_path = os.path.join(dirname, new_name)
-    if new_path != file_path and not os.path.exists(new_path):
+def rename_file(path):
+    dir_, name = os.path.dirname(path), os.path.basename(path)
+    new = extract_requisites(name)
+    if not new: return None
+    new_path = os.path.join(dir_, new)
+    if new_path != path and not os.path.exists(new_path):
         try:
-            os.rename(file_path, new_path)
-            log(f"Переименован по реквизитам: {filename} → {new_name}")
+            os.rename(path, new_path)
+            log(f"Переименован: {name} → {new}")
             return new_path
         except Exception as e:
-            log(f"Ошибка переименования {filename}: {e}")
+            log(f"Ошибка переименования {name}: {e}")
     return None
 
-def delete_junk_files():
-    junk_exts = [".tmp", ".crdownload", ".part", ".ds_store"]
-    junk_prefixes = ["~$", ".~lock"]
-
-    deleted_count = 0
-    for filename in os.listdir(source_folder):
-        lower = filename.lower()
-        if any(lower.endswith(ext) for ext in junk_exts) or any(lower.startswith(pref) for pref in junk_prefixes):
-            path = os.path.join(source_folder, filename)
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-                    log(f"Удалён мусор: {filename}")
-                    deleted_count += 1
-            except Exception as e:
-                log(f"Ошибка удаления мусора {filename}: {e}")
-    print(f"Удалено мусорных файлов: {deleted_count}")
-
-def archive_old_files(days=30):
-    archive_root = os.path.join(source_folder, "Архив")
-    now = time.time()
-    cutoff = now - days * 86400
-
-    for filename in os.listdir(source_folder):
-        path = os.path.join(source_folder, filename)
-        if os.path.isfile(path):
-            ctime = os.path.getctime(path)
-            if ctime < cutoff:
-                dt = datetime.fromtimestamp(ctime)
-                folder = os.path.join(archive_root, f"{dt.year}", f"{dt.month:02d}.{month_names[dt.month]}")
-                os.makedirs(folder, exist_ok=True)
-                target_path = os.path.join(folder, filename)
-                count = 1
-                while os.path.exists(target_path):
-                    name, ext = os.path.splitext(filename)
-                    target_path = os.path.join(folder, f"{name} ({count}){ext}")
-                    count += 1
-                try:
-                    shutil.move(path, target_path)
-                    log(f"Заархивирован: {filename} → {folder}")
-                except Exception as e:
-                    log(f"Ошибка архивации {filename}: {e}")
-
-def move_file(file_path):
-    if not os.path.isfile(file_path):
-        return
-
-    filename = os.path.basename(file_path)
-
-    if should_ignore(filename):
-        log(f"Игнорирован: {filename}")
-        return
-
-    ext = get_extension(filename)
-    category = get_category(ext)
-    date_folder = get_date_folder(file_path)
-
-    # Убираем keyword_folder, кладём всегда в category/date_folder
-    target_dir = os.path.join(source_folder, category, date_folder)
-    os.makedirs(target_dir, exist_ok=True)
-
-    new_path = os.path.join(target_dir, filename)
-    count = 1
-    while os.path.exists(new_path):
-        name, ext = os.path.splitext(filename)
-        new_path = os.path.join(target_dir, f"{name} ({count}){ext}")
-        count += 1
-
+def move_file(path):
+    if not os.path.isfile(path): return
+    new = rename_file(path)
+    if new: path = new
+    name = os.path.basename(path)
+    if should_ignore(name): return
+    ext = get_ext(name)
+    cat = get_category(ext)
+    date = get_folder_by_date(path)
+    sub = get_keyword_folder(name)
+    # Собираем путь в один проход без лишних операций
+    parts = [SOURCE, cat]
+    if sub: parts.append(sub)
+    parts.append(date)
+    target = Path(*parts)
+    target.mkdir(parents=True, exist_ok=True)
+    dst = target / name
+    i = 1
+    while dst.exists():
+        stem, ext_ = os.path.splitext(name)
+        dst = target / f"{stem} ({i}){ext_}"
+        i += 1
     try:
-        shutil.move(file_path, new_path)
-        log(f"Перемещён: {filename} → {target_dir}")
-        print(f"[✔] {filename} → {category}/{date_folder}")
+        shutil.move(path, dst)
+        log(f"Перемещён: {name} → {dst}")
+        print(f"[✔] {name} → {cat}/{date}")
     except Exception as e:
-        log(f"Ошибка перемещения {filename}: {str(e)}")
+        log(f"Ошибка перемещения {name}: {e}")
 
-
-def sort_existing_files():
-    for filename in os.listdir(source_folder):
-        path = os.path.join(source_folder, filename)
-        move_file(path)
+def sort_existing():
+    # Используем генератор с проверкой файла, избегая лишних вызовов
+    for entry in os.scandir(SOURCE):
+        if entry.is_file():
+            move_file(entry.path)
 
 def setup_autostart():
     try:
-        pythonw = shutil.which("pythonw")
-        if not pythonw:
-            log("❌ Не найден pythonw.exe")
-            return
-
-        script_path = os.path.realpath(__file__)
-        startup_dir = os.path.join(os.getenv("APPDATA"), "Microsoft\\Windows\\Start Menu\\Programs\\Startup")
-        bat_path = os.path.join(startup_dir, "start_fileninja.bat")
-
-        content = f'@echo off\ncd /d "{os.path.dirname(script_path)}"\nstart "" "{pythonw}" "{script_path}"\n'
-
-        with open(bat_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        log(f"✅ Автозапуск настроен: {bat_path}")
+        exe = shutil.which("pythonw")
+        if not exe: return log("❌ Не найден pythonw.exe")
+        bat = Path(os.getenv("APPDATA")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "start_fileninja.bat"
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write(f'@echo off\ncd /d "{os.path.dirname(__file__)}"\nstart "" "{exe}" "{__file__}"\n')
+        log(f"✅ Автозапуск настроен: {bat}")
     except Exception as e:
         log(f"❌ Ошибка автозапуска: {e}")
 
-class FileHandler(FileSystemEventHandler):
+class Handler(FileSystemEventHandler):
     def on_created(self, event):
-        time.sleep(1.5)
+        if event.is_directory: return
+        time.sleep(1.5)  # Ждём, пока файл запишется полностью
         move_file(event.src_path)
 
-if __name__ == "__main__":
+def main():
     setup_autostart()
     log("Запуск FileNinja")
-    print(f"🥷 FileNinja следит за: {source_folder}")
-
-    #delete_junk_files()     # Очистка мусора при старте (раскомментировать при необходимости)
-    #archive_old_files()      # Автоархивация старых файлов при старте
-    sort_existing_files()    # Сортировка уже существующих файлов
-
+    print(f"🥷 FileNinja следит за: {SOURCE}")
+    sort_existing()
     observer = Observer()
-    observer.schedule(FileHandler(), source_folder, recursive=False)
+    observer.schedule(Handler(), SOURCE, recursive=False)
     observer.start()
-
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
         log("FileNinja остановлен вручную")
-
     observer.join()
+
+if __name__ == "__main__":
+    main()
